@@ -29,6 +29,7 @@ import java.util.UUID.randomUUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.ConcurrentHashMap
 import sangria.renderer.QueryRenderer
+import sangria.ast.Document
 
 object Hubburu {
 
@@ -50,6 +51,8 @@ object Hubburu {
     }
   }
 
+  private val CONTAINS_NUMBER = "\\.[0-9]+\\."
+  private val dateFormatter = DateTimeFormatter.ISO_OFFSET_DATE_TIME
   private val sttpBackend = AsyncHttpClientFutureBackend()
   private val MAX_TRACING_SIZE = 2000
   private val MAX_ERRORS_SIZE = 1000
@@ -104,28 +107,206 @@ object Hubburu {
     }
   }
 
+  private def denormalizeList(
+      tracing: ArrayBuffer[(String, Double, Double)],
+      lookup: TrieMap[
+        String,
+        ((String, Double, Double), (String, Double, Double))
+      ]
+  ) = {
+    var newTracing = ArrayBuffer[(String, Double, Double)]()
+    tracing.foreach(f => {
+      if (f._2 < 0) {
+        val minMax = lookup.getOrElse(f._1, null)
+        newTracing += minMax._1
+        if (minMax._1._1 != minMax._2._1) {
+          newTracing += minMax._2
+        }
+      } else {
+        newTracing += f
+      }
+    })
+    newTracing
+  }
+
+  private def postProcessLists(
+      tracing: ArrayBuffer[(String, Double, Double)],
+      lookup: TrieMap[
+        String,
+        ((String, Double, Double), (String, Double, Double))
+      ]
+  ) = {
+    tracing.foreach(trace => {
+      if (trace._1.matches(CONTAINS_NUMBER)) {
+        val normalized = trace._1.replaceAll(CONTAINS_NUMBER, ".X.");
+        val earlierValues =
+          lookup.getOrElse(normalized, null)
+        if (earlierValues == null) {
+          lookup.put(normalized, (trace, trace))
+        } else {
+          var min = earlierValues._1
+          var max = earlierValues._2
+          var write = false
+          if (trace._2 < min._2) {
+            min = trace
+            write = true
+          }
+          if (trace._2 > max._2) {
+            max = trace
+            write = true
+          }
+          if (write) {
+            lookup.put(normalized, (min, max))
+          }
+        }
+      }
+    })
+    val newList = ArrayBuffer[(String, Double, Double)]()
+    tracing.foreach(trace => {
+      if (trace._1.matches(CONTAINS_NUMBER)) {
+
+        val normalized = trace._1.replaceAll(CONTAINS_NUMBER, ".X.");
+        val earlierValues =
+          lookup.getOrElse(normalized, null)
+        if (earlierValues != null) {
+          newList += earlierValues._1
+          if (earlierValues._1._1 != earlierValues._2._1) {
+            newList += earlierValues._2
+          }
+          lookup.remove(normalized)
+        }
+      } else {
+        newList += trace
+      }
+    })
+    newList
+  }
+
   def sendOperation(
-      report: String,
-      apiKey: String
+      report: HubburuReport,
+      apiKey: String = scala.util.Properties.envOrElse("HUBBURU_API_KEY", null),
+      tracingMode: Int = NO_TRACING
   ): Unit = {
-    if (apiKey == null) {
-      throw new RuntimeException("MISSING API KEY FOR HUBBURU")
+    try {
+      if (apiKey == null) {
+        Console.err.println("MISSING API KEY FOR HUBBURU")
+      }
+      val operationName = report.operationName
+      val postProcessingStart = System.nanoTime()
+      val totalMs = postProcessingStart - report.startTime
+
+      val sb = new StringBuilder
+      sb.append("{\"environment\":\"")
+        .append(report.environment)
+        .append("\",\"gzippedOperationBody\":\"")
+        .append(Gzip.compress(QueryRenderer.renderPretty(report.sdl)))
+        .append("\",\"totalMs\":")
+        .append(toReportMs(totalMs))
+        .append(",\"resolvers\":\"")
+
+      var tracing = report.tracing
+
+      if (tracingMode == LIST_NORMALIZED) {
+        tracing = denormalizeList(tracing, report.listLookup)
+      }
+
+      var zipped = Gzip.compressToByteArray(
+        getTracingString(tracing).toString()
+      )
+      var resolversTooLarge = false
+      if (zipped.length > MAX_TRACING_SIZE) {
+        if (tracingMode == POST_PROCESS_LISTS) {
+          tracing = postProcessLists(tracing, report.listLookup)
+        }
+
+        zipped = Gzip.compressToByteArray(
+          getTracingString(tracing.slice(0, 200))
+        )
+        resolversTooLarge = true
+      }
+      var errorsTooLarge = false
+
+      sb.append(Base64.getEncoder.encodeToString(zipped))
+        .append("\",\"createdAt\":\"")
+        .append(OffsetDateTime.now().format(dateFormatter))
+        .append("\",\"operationName\":\"")
+        .append(operationName)
+        .append("\",")
+      if (report.loaders.size > 0) {
+        sb.append("\"loaders\":{")
+
+        report.loaders.foreach((v) => {
+          sb.append("\"").append(v._1).append("\":[")
+
+          v._2.foreach(t => {
+            sb.append("[").append(t._1).append(",").append(t._2).append("],")
+          })
+
+          sb.deleteCharAt(sb.length() - 1)
+          sb.append("]},")
+        })
+      }
+      if (report.clientName != null) {
+        sb.append("\"clientName\":\"")
+          .append(report.clientName)
+          .append("\",")
+      }
+      if (report.clientVersion != null) {
+        sb.append("\"clientVersion\":\"")
+          .append(report.clientVersion)
+          .append("\",")
+      }
+      sb.append(("\"errors\":"))
+      if (report.errors.length > 0) {
+        var compressedErrs =
+          Gzip.compressToByteArray(getErrorString(report.errors))
+
+        if (compressedErrs.length > MAX_ERRORS_SIZE) {
+          errorsTooLarge = true
+          compressedErrs = Gzip.compressToByteArray(
+            getErrorString((report.errors.slice(0, 5)))
+          )
+        }
+        sb.append("\"")
+          .append(Base64.getEncoder.encodeToString(compressedErrs))
+          .append("\"")
+      } else {
+        sb.append("null")
+      }
+
+      sb.append(",\"meta\": {\"postProcessingTime\":")
+        .append(toReportMs((System.nanoTime() - postProcessingStart)))
+
+      if (resolversTooLarge) {
+        sb.append(",\"resolversTooLarge\":").append(report.tracing.length)
+      }
+      if (errorsTooLarge) {
+        sb.append(",\"errorsTooLarge\":").append(report.errors.length)
+      }
+      sb.append("}}")
+      val result = basicRequest
+        .post(uri"$BASE_URL/operation")
+        .body(sb.toString())
+        .header("Content-Type", "application/json")
+        .header("x-api-key", apiKey)
+        .header("hubburu-plugin", "sangria-0.0.2")
+        .header("Charset", "UTF-8")
+        .send(backend = sttpBackend)
+    } catch {
+      case e: Throwable => Console.err.println(e)
     }
-    val result = basicRequest
-      .post(uri"$BASE_URL/operation")
-      .body(report)
-      .header("Content-Type", "application/json")
-      .header("x-api-key", apiKey)
-      .header("hubburu-plugin", "sangria-0.0.2")
-      .header("Charset", "UTF-8")
-      .send(backend = sttpBackend)
   }
 
   class HubburuReport(
+      val sdl: Document,
+      val environment: String = "default",
       val operationName: String,
       val requestId: String = randomUUID().toString(),
       val startTime: Long = System.nanoTime(),
-      val isSampled: Boolean = true
+      val isSampled: Boolean = true,
+      val clientName: String = null,
+      val clientVersion: String = null,
+      error: Throwable = null
   ) {
     // Key, duration, offset
     val tracing = ArrayBuffer[(String, Double, Double)]()
@@ -137,6 +318,10 @@ object Hubburu {
         String,
         ((String, Double, Double), (String, Double, Double))
       ]()
+
+    if (error != null) {
+      errors += error
+    }
   }
 
   def getTracingString(list: ArrayBuffer[(String, Double, Double)]) = {
@@ -165,9 +350,10 @@ object Hubburu {
   def getErrorString(list: ArrayBuffer[Throwable]) = {
     val errorSb = new StringBuilder("[")
     list.foreach(e => {
+      println(e.getMessage())
       errorSb
         .append("{\"message\":\"")
-        .append(e.getMessage())
+        .append(e.getMessage().replaceAll("\n", ""))
         .append("\",\"details\":\"")
         .append(
           e.getStackTrace()
@@ -261,10 +447,6 @@ object Hubburu {
     * @param apiKey
     *   Defaults to the environment variable "HUBBURU_API_KEY", but if can
     *   overwrite it with this parameter.
-    *
-    * @param onInternalError
-    *   Overwrites the standard behavior (log to stderr) of some runtime errors
-    *   of the Hubburu middleware.
     */
   class HubburuMiddleware[Ctx](
       environment: String = "default",
@@ -278,23 +460,22 @@ object Hubburu {
         (_: Any) => null,
       getRequestId: ((MiddlewareQueryContext[Ctx, _, _]) => String) =
         (_: Any) => randomUUID().toString(),
-      apiKey: String = scala.util.Properties.envOrElse("HUBBURU_API_KEY", null),
-      onInternalError: ((Throwable) => Unit) = (e) => {
-        Console.err.println(e)
-      }
+      apiKey: String = scala.util.Properties.envOrElse("HUBBURU_API_KEY", null)
   ) extends Middleware[Ctx]
       with MiddlewareAfterField[Ctx]
       with MiddlewareErrorField[Ctx] {
 
-    private val dateFormatter = DateTimeFormatter.ISO_OFFSET_DATE_TIME
     type FieldVal = Long
     type QueryVal = HubburuReport
-    val CONTAINS_NUMBER = "\\.[0-9]+\\."
 
     def beforeQuery(context: MiddlewareQueryContext[Ctx, _, _]) = {
       val requestId = getRequestId(context)
       val report =
         new HubburuReport(
+          environment = environment,
+          clientVersion = getClientVersion(context),
+          clientName = getClientName(context),
+          sdl = context.queryAst,
           isSampled = sampleFunction(context),
           requestId = requestId,
           operationName = context.operationName.getOrElse("?")
@@ -306,81 +487,6 @@ object Hubburu {
       report
     }
 
-    private def denormalizeList(
-        tracing: ArrayBuffer[(String, Double, Double)],
-        lookup: TrieMap[
-          String,
-          ((String, Double, Double), (String, Double, Double))
-        ]
-    ) = {
-      var newTracing = ArrayBuffer[(String, Double, Double)]()
-      tracing.foreach(f => {
-        if (f._2 < 0) {
-          val minMax = lookup.getOrElse(f._1, null)
-          newTracing += minMax._1
-          if (minMax._1._1 != minMax._2._1) {
-            newTracing += minMax._2
-          }
-        } else {
-          newTracing += f
-        }
-      })
-      newTracing
-    }
-
-    private def postProcessLists(
-        tracing: ArrayBuffer[(String, Double, Double)],
-        lookup: TrieMap[
-          String,
-          ((String, Double, Double), (String, Double, Double))
-        ]
-    ) = {
-      tracing.foreach(trace => {
-        if (trace._1.matches(CONTAINS_NUMBER)) {
-          val normalized = trace._1.replaceAll(CONTAINS_NUMBER, ".X.");
-          val earlierValues =
-            lookup.getOrElse(normalized, null)
-          if (earlierValues == null) {
-            lookup.put(normalized, (trace, trace))
-          } else {
-            var min = earlierValues._1
-            var max = earlierValues._2
-            var write = false
-            if (trace._2 < min._2) {
-              min = trace
-              write = true
-            }
-            if (trace._2 > max._2) {
-              max = trace
-              write = true
-            }
-            if (write) {
-              lookup.put(normalized, (min, max))
-            }
-          }
-        }
-      })
-      val newList = ArrayBuffer[(String, Double, Double)]()
-      tracing.foreach(trace => {
-        if (trace._1.matches(CONTAINS_NUMBER)) {
-
-          val normalized = trace._1.replaceAll(CONTAINS_NUMBER, ".X.");
-          val earlierValues =
-            lookup.getOrElse(normalized, null)
-          if (earlierValues != null) {
-            newList += earlierValues._1
-            if (earlierValues._1._1 != earlierValues._2._1) {
-              newList += earlierValues._2
-            }
-            lookup.remove(normalized)
-          }
-        } else {
-          newList += trace
-        }
-      })
-      newList
-    }
-
     def afterQuery(
         queryVal: QueryVal,
         context: MiddlewareQueryContext[Ctx, _, _]
@@ -389,109 +495,7 @@ object Hubburu {
       if (!shouldSend(queryVal)) {
         return
       }
-      val postProcessingStart = System.nanoTime()
-      val totalMs = postProcessingStart - queryVal.startTime
-      try {
-        val sdl = Gzip.compress(QueryRenderer.renderPretty(context.queryAst))
-        val operationName = queryVal.operationName
-
-        val sb = new StringBuilder
-        sb.append("{\"environment\":\"")
-          .append(environment)
-          .append("\",\"gzippedOperationBody\":\"")
-          .append(sdl)
-          .append("\",\"totalMs\":")
-          .append(toReportMs(totalMs))
-          .append(",\"resolvers\":\"")
-
-        var tracing = queryVal.tracing
-
-        if (tracingMode == LIST_NORMALIZED) {
-          tracing = denormalizeList(tracing, queryVal.listLookup)
-        }
-
-        var zipped = Gzip.compressToByteArray(
-          getTracingString(tracing).toString()
-        )
-        var resolversTooLarge = false
-        if (zipped.length > MAX_TRACING_SIZE) {
-          if (tracingMode == POST_PROCESS_LISTS) {
-            tracing = postProcessLists(tracing, queryVal.listLookup)
-          }
-
-          zipped = Gzip.compressToByteArray(
-            getTracingString(tracing.slice(0, 200))
-          )
-          resolversTooLarge = true
-        }
-        var errorsTooLarge = false
-        val clientVersion = getClientVersion(context)
-        val clientName = getClientName(context)
-
-        sb.append(Base64.getEncoder.encodeToString(zipped))
-          .append("\"")
-          .append(",\"createdAt\":\"")
-          .append(OffsetDateTime.now().format(dateFormatter))
-          .append("\",\"operationName\":\"")
-          .append(operationName)
-          .append("\",")
-
-        if (queryVal.loaders.size > 0) {
-          sb.append("\"loaders\":{")
-
-          queryVal.loaders.foreach((v) => {
-            sb.append("\"").append(v._1).append("\":[")
-
-            v._2.foreach(t => {
-              sb.append("[").append(t._1).append(",").append(t._2).append("],")
-            })
-
-            sb.deleteCharAt(sb.length() - 1)
-            sb.append("]},")
-          })
-        }
-        if (clientName != null) {
-          sb.append("\"clientName\":\"")
-            .append(clientName)
-        }
-        if (clientVersion != null) {
-          sb.append("\",\"clientVersion\":\"")
-            .append(clientVersion)
-        }
-        sb.append(("\",\"errors\":"))
-
-        if (queryVal.errors.length > 0) {
-          var compressedErrs =
-            Gzip.compressToByteArray(getErrorString(queryVal.errors))
-
-          if (compressedErrs.length > MAX_ERRORS_SIZE) {
-            errorsTooLarge = true
-            compressedErrs = Gzip.compressToByteArray(
-              getErrorString((queryVal.errors.slice(0, 5)))
-            )
-          }
-          sb.append("\"")
-            .append(Base64.getEncoder.encodeToString(compressedErrs))
-            .append("\"")
-        } else {
-          sb.append("null")
-        }
-
-        sb.append(",\"meta\": {\"postProcessingTime\":")
-          .append(toReportMs((System.nanoTime() - postProcessingStart)))
-
-        if (resolversTooLarge) {
-          sb.append(",\"resolversTooLarge\": ").append(queryVal.tracing.length)
-        }
-        if (errorsTooLarge) {
-          sb.append(",\"errorsTooLarge\": ").append(queryVal.errors.length)
-        }
-        sb.append("}}")
-        Hubburu.sendOperation(sb.toString, apiKey)
-      } catch {
-        case e: Throwable => onInternalError(e)
-      }
-
+      Hubburu.sendOperation(queryVal, apiKey, tracingMode)
     }
 
     def beforeField(
