@@ -99,7 +99,7 @@ object Hubburu {
         .body(sb.toString)
         .header("Content-Type", "application/json")
         .header("x-api-key", apiKey)
-        .header("hubburu-plugin", "sangria-0.0.2")
+        .header("hubburu-plugin", "sangria-0.0.4")
         .header("Charset", "UTF-8")
         .send(backend = sttpBackend)
     } catch {
@@ -194,6 +194,8 @@ object Hubburu {
       val operationName = report.operationName
       val postProcessingStart = System.nanoTime()
       val totalMs = postProcessingStart - report.startTime
+      var resolversTooLarge = false
+      var errorsTooLarge = false
 
       val sb = new StringBuilder
       sb.append("{\"environment\":\"")
@@ -202,32 +204,35 @@ object Hubburu {
         .append(Gzip.compress(QueryRenderer.renderPretty(report.sdl)))
         .append("\",\"totalMs\":")
         .append(toReportMs(totalMs))
-        .append(",\"resolvers\":\"")
+        .append(",")
 
-      var tracing = report.tracing
+      if (report.tracing.length > 0) {
+        sb.append("\"resolvers\":\"")
 
-      if (tracingMode == LIST_NORMALIZED) {
-        tracing = denormalizeList(tracing, report.listLookup)
-      }
+        var tracing = report.tracing
 
-      var zipped = Gzip.compressToByteArray(
-        getTracingString(tracing).toString()
-      )
-      var resolversTooLarge = false
-      if (zipped.length > MAX_TRACING_SIZE) {
-        if (tracingMode == POST_PROCESS_LISTS) {
-          tracing = postProcessLists(tracing, report.listLookup)
+        if (tracingMode == LIST_NORMALIZED) {
+          tracing = denormalizeList(tracing, report.listLookup)
         }
 
-        zipped = Gzip.compressToByteArray(
-          getTracingString(tracing.slice(0, 200))
+        var zipped = Gzip.compressToByteArray(
+          getTracingString(tracing).toString()
         )
-        resolversTooLarge = true
-      }
-      var errorsTooLarge = false
+        if (zipped.length > MAX_TRACING_SIZE) {
+          if (tracingMode == POST_PROCESS_LISTS) {
+            tracing = postProcessLists(tracing, report.listLookup)
+          }
 
-      sb.append(Base64.getEncoder.encodeToString(zipped))
-        .append("\",\"createdAt\":\"")
+          zipped = Gzip.compressToByteArray(
+            getTracingString(tracing.slice(0, 200))
+          )
+          resolversTooLarge = true
+        }
+
+        sb.append(Base64.getEncoder.encodeToString(zipped))
+          .append("\",")
+      }
+      sb.append("\"createdAt\":\"")
         .append(OffsetDateTime.now().format(dateFormatter))
         .append("\",\"operationName\":\"")
         .append(operationName)
@@ -289,7 +294,7 @@ object Hubburu {
         .body(sb.toString())
         .header("Content-Type", "application/json")
         .header("x-api-key", apiKey)
-        .header("hubburu-plugin", "sangria-0.0.2")
+        .header("hubburu-plugin", "sangria-0.0.4")
         .header("Charset", "UTF-8")
         .send(backend = sttpBackend)
     } catch {

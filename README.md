@@ -5,7 +5,7 @@ A middleware for integrating Hubburu with Sangria (Scala) GraphQL
 ## Installation
 
 ```sbt
-libraryDependencies += "com.hubburu" %% "hubburu-sangria-middleware" % "0.0.3"
+libraryDependencies += "com.hubburu" %% "hubburu-sangria-middleware" % "0.0.4"
 ```
 
 ## Usage

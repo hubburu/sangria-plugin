@@ -1,5 +1,5 @@
 name := "Hubburu Sangria middleware"
-version := "0.0.3"
+version := "0.0.4"
 
 description := "A middleware to integrate Hubburu with Sangria"
 
