@@ -28,6 +28,7 @@ import scala.util.Try
 import java.util.UUID.randomUUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.ConcurrentHashMap
+import sangria.renderer.QueryRenderer
 
 object Hubburu {
 
@@ -95,7 +96,7 @@ object Hubburu {
         .body(sb.toString)
         .header("Content-Type", "application/json")
         .header("x-api-key", apiKey)
-        .header("hubburu-plugin", "sangria-1.0.0")
+        .header("hubburu-plugin", "sangria-0.0.2")
         .header("Charset", "UTF-8")
         .send(backend = sttpBackend)
     } catch {
@@ -115,7 +116,7 @@ object Hubburu {
       .body(report)
       .header("Content-Type", "application/json")
       .header("x-api-key", apiKey)
-      .header("hubburu-plugin", "sangria-1.0.0")
+      .header("hubburu-plugin", "sangria-0.0.2")
       .header("Charset", "UTF-8")
       .send(backend = sttpBackend)
   }
@@ -391,7 +392,7 @@ object Hubburu {
       val postProcessingStart = System.nanoTime()
       val totalMs = postProcessingStart - queryVal.startTime
       try {
-        val sdl = Gzip.compress(context.queryAst.renderPretty)
+        val sdl = Gzip.compress(QueryRenderer.renderPretty(context.queryAst))
         val operationName = queryVal.operationName
 
         val sb = new StringBuilder

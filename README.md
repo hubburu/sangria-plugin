@@ -2,12 +2,23 @@
 
 A middleware for integrating Hubburu with Sangria (Scala) GraphQL
 
+## Installation
+
+```sbt
+libraryDependencies += "com.hubburu" %% "hubburu-sangria-middleware" % "0.0.2"
+```
+
 ## Usage
 
 There are two integration points you need to make to integrate with Hubburu.
 
-1. Upload schema SDL to Hubburu
-2. Send operation reports to Hubburu
+1. Add you API key
+2. Upload schema SDL to Hubburu
+3. Send operation reports to Hubburu
+
+### Adding Your API Key
+
+Register for Hubburu, and you will be able to access your API Key from there. The recommended way is to add it to your environment variables.
 
 ### Upload schema
 
